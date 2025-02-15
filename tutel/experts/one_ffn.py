@@ -5,13 +5,13 @@ import torch
 from .. import net
 
 class FusedExpertsNetwork(torch.nn.Module):
-    def __init__(self, model_dim, hidden_size_per_expert, num_experts_per_device, sharded_count, activation_fn=None, activation_fn_with_self=None, output_dim=None, has_fc1_bias=True, has_fc2_bias=True):
+    def __init__(self, model_dim, hidden_size_per_expert, local_experts, sharded_count, activation_fn=None, activation_fn_with_self=None, output_dim=None, has_fc1_bias=True, has_fc2_bias=True):
         super().__init__()
         self.skip_expert = (int(torch.os.environ.get('SKIP_EXPERT', '0')) != 0)
         assert hidden_size_per_expert % sharded_count == 0, f"Can't evenly divide hidden_size_per_expert ({hidden_size_per_expert}) to {sharded_count} slices."
         self.model_dim = model_dim
         self.hidden_size_per_expert = hidden_size_per_expert
-        self.local_experts = num_experts_per_device
+        self.local_experts = local_experts
         self.sharded_count = sharded_count
         self.hidden_size = hidden_size_per_expert // sharded_count
         self.output_dim = output_dim or model_dim
@@ -23,14 +23,14 @@ class FusedExpertsNetwork(torch.nn.Module):
             activation_fn = lambda x: F.relu(x)
         self.activation_fn = activation_fn
 
-        self.batched_fc1_w = torch.nn.Parameter(torch.empty(num_experts_per_device, self.hidden_size, model_dim))
-        self.batched_fc2_w = torch.nn.Parameter(torch.empty(num_experts_per_device, self.hidden_size, self.output_dim))
+        self.batched_fc1_w = torch.nn.Parameter(torch.empty(local_experts, self.hidden_size, model_dim))
+        self.batched_fc2_w = torch.nn.Parameter(torch.empty(local_experts, self.hidden_size, self.output_dim))
         if has_fc1_bias:
-             self.batched_fc1_bias = torch.nn.Parameter(torch.empty(num_experts_per_device, self.hidden_size))
+             self.batched_fc1_bias = torch.nn.Parameter(torch.empty(local_experts, self.hidden_size))
         else:
              self.register_parameter('batched_fc1_bias', None)
         if has_fc2_bias:
-            self.batched_fc2_bias = torch.nn.Parameter(torch.empty(num_experts_per_device, (self.output_dim + sharded_count - 1) // sharded_count))
+            self.batched_fc2_bias = torch.nn.Parameter(torch.empty(local_experts, (self.output_dim + sharded_count - 1) // sharded_count))
         else:
             self.register_parameter('batched_fc2_bias', None)
 
@@ -49,16 +49,14 @@ class FusedExpertsNetwork(torch.nn.Module):
                     self.batched_fc2_bias[i] = fc2.bias[:self.batched_fc2_bias.size(-1)]
 
     def extra_repr(self):
-        return 'model_dim=%d, hidden_size=%d, output_dim=%d, num_experts_per_device=%d. has_fc1_bias=%s, has_fc2_bias=%s.' % (
+        return 'model_dim=%d, hidden_size=%d, output_dim=%d, local_experts=%d. has_fc1_bias=%s, has_fc2_bias=%s.' % (
             self.batched_fc1_w.size(2), self.batched_fc1_w.size(1), self.batched_fc2_w.size(2), self.batched_fc1_w.size(0),
             self.batched_fc1_bias is not None, self.batched_fc2_bias is not None
         )
 
-    def forward(self, x, ctx):
-          # x.shape = torch.Size([num_local_experts, batch_size * num_tokens * top / (num_local_experts * a2a_ffn_overlap_degree), model_dim])
+    def forward(self, x, ctx):  # x.shape = torch.Size([num_local_experts, batch_size * num_tokens * top / (num_local_experts * a2a_ffn_overlap_degree), model_dim])
         if self.skip_expert:
             return x
-
         batched_fc1_w = self.batched_fc1_w
         batched_fc2_w = self.batched_fc2_w
         if self.batched_fc1_bias is not None:
@@ -90,20 +88,16 @@ class FusedExpertsNetwork(torch.nn.Module):
                 batched_fc2_bias = net.zero_gather(batched_fc2_bias, group=ctx.group).view(ctx.num_global_experts, 1, -1)
         else:
             if ctx.sharded_count > 1:
-                mesh_size = net.get_world_size(ctx.group)
-                if mesh_size > 1 and mesh_size < net.get_world_size():
-                    ctx.adaptive_degree = ctx.sharded_count
                 group_size = ctx.sharded_count // ctx.adaptive_degree
-
                 if group_size > 1:
-                    ffn_zero_group = net.create_groups_from_world(group_count=-group_size, parent_group=ctx.group).model_group
+                    ffn_zero_group = net.create_groups_from_world(group_count=-group_size).model_group
                     batched_fc1_w = net.zero_gather(batched_fc1_w, group=ffn_zero_group).view(1, -1, ctx.model_dim)
                     batched_fc2_w = net.zero_gather(batched_fc2_w, group=ffn_zero_group).view(1, -1, self.output_dim)
                     if self.batched_fc1_bias is not None:
                         batched_fc1_bias = net.zero_gather(batched_fc1_bias, group=ffn_zero_group).view(1, 1, -1)
 
                 if self.batched_fc2_bias is not None:
-                    batched_fc2_bias = net.zero_gather(batched_fc2_bias, group=net.create_groups_from_world(group_count=ctx.num_global_experts, parent_group=ctx.group).model_group)
+                    batched_fc2_bias = net.zero_gather(batched_fc2_bias, group=net.create_groups_from_world(group_count=ctx.num_global_experts).model_group)
                     batched_fc2_bias = batched_fc2_bias.view(1, 1, -1)
 
                     if ctx.adaptive_degree > 1:
@@ -119,10 +113,10 @@ class FusedExpertsNetwork(torch.nn.Module):
             y = torch.add(y, batched_fc1_bias)
         y = self.activation_fn(y)
         # y.shape=torch.Size([num_local_experts, batch_size * num_tokens * top / (num_local_experts * a2a_ffn_overlap_degree), hidden_size]), batched_fc2_w.shape=torch.Size([num_local_experts, hidden_size, model_dim])
-        y = torch.matmul(y, batched_fc2_w)
-        # y.shape=torch.Size([num_local_experts, batch_size * num_tokens * top / (num_local_experts * a2a_ffn_overlap_degree), model_dim])
-        if self.batched_fc2_bias is not None:
-            y = torch.add(y, batched_fc2_bias)
+        # y = torch.matmul(y, batched_fc2_w)
+        # # y.shape=torch.Size([num_local_experts, batch_size * num_tokens * top / (num_local_experts * a2a_ffn_overlap_degree), model_dim])
+        # if self.batched_fc2_bias is not None:
+        #     y = torch.add(y, batched_fc2_bias)
         return y
 
 

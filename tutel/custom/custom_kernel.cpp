@@ -437,6 +437,7 @@ inline at::cuda::CUDAStream& get_default_stream() {
 
 inline at::cuda::CUDAStream& get_nccl_stream() {
   static at::cuda::CUDAStream nccl_stream = at::cuda::getStreamFromPool();
+  // static at::cuda::CUDAStream nccl_stream = at::cuda::getStreamFromPool(true);
   return nccl_stream;
 }
 
@@ -518,71 +519,85 @@ static void batch_all_gather_v(const std::vector<torch::Tensor> &ins, const std:
 }
 
 static std::vector<torch::Tensor> nccl_all_to_all_scatter_async(
-    const torch::Tensor &input,
-    torch::IntArrayRef output_size,
-    int num_split,
-    int num_slices_per_split,
-    bool is_backward) {
-  CHECK_CUDA(input);
-  CHECK_LE(num_split, g_cuda_events.size());
+  const torch::Tensor &input,
+  torch::IntArrayRef output_size,
+  int num_split,
+  int num_slices_per_split,
+  bool is_backward) {
+// 一、参数检查
+CHECK_CUDA(input); // 验证输入张量 input 是否位于CUDA设备上
+CHECK_LE(num_split, g_cuda_events.size()); // 检查 num_split 是否小于等于预定义的CUDA事件列表的大小。
 
-  CHECK_EQ(0, num_slices_per_split % g_world_size);
-  size_t length = input.nbytes();
-  size_t num_slices = num_slices_per_split * num_split;
-  CHECK_EQ(0, length % num_slices);
-  size_t slice_size = length / num_slices;
+CHECK_EQ(0, num_slices_per_split % g_world_size); // 确认 num_slices_per_split 能够被g_world_size 整除，确保数据均匀分布。
+size_t length = input.nbytes(); // 计算输入张量的字节大小 length，并确保它可以被 num_slices 整除，其中 num_slices = num_slices_per_split * num_split。
+size_t num_slices = num_slices_per_split * num_split;
+CHECK_EQ(0, length % num_slices);
+size_t slice_size = length / num_slices; // 计算每个切片的大小
 
-  // Save original stream and switch to NCCL stream
-  // Output tensors must be allocated in NCCL stream context to prevent PyTorch Caching Allocator from recycling it
-  const at::cuda::CUDAStream& original_stream = at::cuda::getCurrentCUDAStream();
-  at::cuda::setCurrentCUDAStream(get_nccl_stream());
+// 二、切换流
+// 保存当前的CUDA流 original_stream，并切换到NCCL专用的CUDA流 get_nccl_stream()，因为NCCL操作应在自己的流中进行。
+// Save original stream and switch to NCCL stream
+// Output tensors must be allocated in NCCL stream context to prevent PyTorch Caching Allocator from recycling it
+const at::cuda::CUDAStream& original_stream = at::cuda::getCurrentCUDAStream();
+at::cuda::setCurrentCUDAStream(get_nccl_stream());
 
-  // Computation stream allocator will add blocking event to nccl stream after nccl kernels
-  c10::cuda::CUDACachingAllocator::recordStream(input.storage().data_ptr(), get_nccl_stream());
+// Computation stream allocator will add blocking event to nccl stream after nccl kernels
+c10::cuda::CUDACachingAllocator::recordStream(input.storage().data_ptr(), get_nccl_stream());
 
-  std::vector<torch::Tensor> output_list(num_split);
-  for (int i = 0; i < num_split; i++) {
-    output_list[i] = torch::empty(output_size, torch::TensorOptions().dtype(input.dtype()).device(input.device()));
+
+// 三、输出张量准备
+// 根据output_size 和input tensor的device, 为每个split创建一个输出张量 output_list。
+std::vector<torch::Tensor> output_list(num_split);
+for (int i = 0; i < num_split; i++) {
+  output_list[i] = torch::empty(output_size, torch::TensorOptions().dtype(input.dtype()).device(input.device()));
+}
+// 使用 c10::cuda::CUDACachingAllocator::recordStream 确保输出张量在NCCL操作完成后才可被计算流访问，防止数据竞争。
+// NCCL stream allocator will add blocking event to computation stream after computation kernels
+for (auto& output : output_list) {
+  c10::cuda::CUDACachingAllocator::recordStream(output.storage().data_ptr(), original_stream);
+}
+
+// 四、NCCL事件管理
+// Acquire 0-th event for single input
+g_cuda_events[0].block(get_nccl_stream()); // 阻塞NCCL流直到第一个事件完成，确保事件的顺序性
+
+// 五、NCCL Send/Recv操作
+for (int i = 0; i < num_split; i++) {
+  // Reverse calculation order in backward for pipelining
+  int calc_idx = is_backward ? num_split - 1 - i : i;
+
+  CHECK_EQ(0, ncclGroupStart());
+  for (int j = 0; j < num_slices_per_split; j++) {
+    CHECK_EQ(0, ncclSend(
+        ((char*)input.data_ptr()) + (j * num_split + calc_idx) * slice_size,
+        slice_size,
+        ncclInt8,
+        g_world_size * j / num_slices_per_split,
+        g_nccl_comm,
+        get_nccl_stream().stream()));
+    CHECK_EQ(0, ncclRecv(
+        ((char*)output_list[calc_idx].data_ptr()) + j * slice_size,
+        slice_size,
+        ncclInt8,
+        g_world_size * j / num_slices_per_split,
+        g_nccl_comm,
+        get_nccl_stream().stream()));
   }
-  // NCCL stream allocator will add blocking event to computation stream after computation kernels
-  for (auto& output : output_list) {
-    c10::cuda::CUDACachingAllocator::recordStream(output.storage().data_ptr(), original_stream);
-  }
+  CHECK_EQ(0, ncclGroupEnd());
 
-  // Acquire 0-th event for single input
-  g_cuda_events[0].block(get_nccl_stream());
+  // 六、在完成一组 ncclSend 和 ncclRecv 后，记录一个事件到NCCL流，这事件标记了计算的完成点。
+  // Release calc_idx-th event
+  g_cuda_events[calc_idx].record(get_nccl_stream());
+}
 
-  for (int i = 0; i < num_split; i++) {
-    // Reverse calculation order in backward for pipelining
-    int calc_idx = is_backward ? num_split - 1 - i : i;
+// 七、恢复原始的cuda流
+// 使用 at::cuda::setCurrentCUDAStream(original_stream); 将当前CUDA流恢复为最初保存的 original_stream。
+// 因为NCCL操作在专用的NCCL流中执行，而通常我们希望后续的计算操作能够在原始的流中进行，以保持程序的正常执行顺序和流之间的同步关系。
+// Switch to original stream
+at::cuda::setCurrentCUDAStream(original_stream);
 
-    CHECK_EQ(0, ncclGroupStart());
-    for (int j = 0; j < num_slices_per_split; j++) {
-      CHECK_EQ(0, ncclSend(
-          ((char*)input.data_ptr()) + (j * num_split + calc_idx) * slice_size,
-          slice_size,
-          ncclInt8,
-          g_world_size * j / num_slices_per_split,
-          g_nccl_comm,
-          get_nccl_stream().stream()));
-      CHECK_EQ(0, ncclRecv(
-          ((char*)output_list[calc_idx].data_ptr()) + j * slice_size,
-          slice_size,
-          ncclInt8,
-          g_world_size * j / num_slices_per_split,
-          g_nccl_comm,
-          get_nccl_stream().stream()));
-    }
-    CHECK_EQ(0, ncclGroupEnd());
-
-    // Release calc_idx-th event
-    g_cuda_events[calc_idx].record(get_nccl_stream());
-  }
-
-  // Switch to original stream
-  at::cuda::setCurrentCUDAStream(original_stream);
-
-  return output_list;
+// 返回之前创建的 output_list，它包含了经过All-to-All操作后重新分布的数据。每个张量在 output_list 中代表了输入张量沿 split_dim 维度分割后的数据，按照特定的规则重新分配给各个GPU节点。
+return output_list;
 }
 
 static torch::Tensor nccl_all_to_all_gather_async(

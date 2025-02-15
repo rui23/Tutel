@@ -14,6 +14,11 @@ from tutel import system
 from tutel import moe as tutel_moe
 from tutel import net
 
+import torch.profiler
+from torch.profiler import profile, record_function, ProfilerActivity
+
+import file_utils, split_utils_wr
+
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--local_rank', type=int, default=-1)
@@ -28,16 +33,17 @@ parser.add_argument('--top', type=int, default=2)
 parser.add_argument('--l_aux_wt', type=float, default=0.0)
 parser.add_argument('--a2a_ffn_overlap_degree', type=int, default=1)
 parser.add_argument('--allreduce_degree', type=int, default=1)
-parser.add_argument('--num_steps', type=int, default=100)
+parser.add_argument('--num_steps', type=int, default=30)
 parser.add_argument('--parallel_type', type=str, default='adaptive:1')
 parser.add_argument('--checkpoint_path', type=str, default='')
 parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
 parser.add_argument('--use_2dh', default=False, action='store_true')
-parser.add_argument('--eval', default=False, action='store_true')
+parser.add_argument('--eval', default=True, action='store_true')
 parser.add_argument('--capacity_factor', type=float, default=1.0)  # 0.0 for dMoE (dropless-MoE), negative for no-padded capacity.
 parser.add_argument('--megablocks_size', type=int, default=0)
 parser.add_argument('--use_tensorcore', default=False, action='store_true')
-parser.add_argument('--expert_type', type=str, default='ffn')
+parser.add_argument('--expert_type', type=str, default='ffn01')
+parser.add_argument('--split_idx', type=int, default=0)
 
 args = parser.parse_args()
 
@@ -47,6 +53,7 @@ if args.use_tensorcore:
 parallel_env = system.init_data_model_parallel(backend='nccl' if args.device == 'cuda' else 'gloo')
 dist_rank, dist_world_size, dist_print = parallel_env.global_rank, parallel_env.global_size, parallel_env.dist_print
 args.local_rank = parallel_env.local_device.index
+# print('local_rank = %s, global_rank = %s, world_size = %s' % (args.local_rank, dist_rank, dist_world_size))
 
 batch_size = args.batch_size
 num_tokens = args.num_tokens
@@ -56,6 +63,17 @@ num_local_experts = args.num_local_experts
 top_value = args.top
 a2a_ffn_overlap_degree = args.a2a_ffn_overlap_degree
 device = parallel_env.local_device
+# split_list = split_utils_wr.predict_moe_baseline_time(batch_size, num_tokens, model_dim, hidden_size, a2a_ffn_overlap_degree, top_value, args.capacity_factor)
+split_lists = [
+    [0.0, 1.5, 3.0, 4.5],
+    [0.0, 1.333333, 2.66666],
+    [0.0, 1.2, 2.4, 3.6, 4.8],
+    [0.0, 1.5, 3.0, 4.5],
+    [0.0, 1.5, 3.0, 4.5],
+    [0.0, 1.5, 3.0, 4.5]
+]
+# split_lists = [[],[],[],[],[],[]]
+split_list = split_lists[args.split_idx]
 
 if args.dtype == 'float32':
     torch.set_default_dtype(torch.float32)
@@ -82,6 +100,7 @@ class ExampleModel(torch.nn.Module):
             a2a_ffn_overlap_degree = a2a_ffn_overlap_degree,
             parallel_type = args.parallel_type,
             use_2dh=args.use_2dh,
+            split_list=split_list,
         )
 
         # Summary of different parameter types: gate, local_experts
@@ -94,11 +113,11 @@ class ExampleModel(torch.nn.Module):
           result = self._moe_layer(input, megablocks_size=args.megablocks_size)
         else:
           result = self._moe_layer(input)
-        result = F.log_softmax(torch.sum(result, dim=2), dim=1)
+        # result = F.log_softmax(torch.sum(result, dim=2), dim=1)
         return result
 
 model = ExampleModel().to(device)
-dist_print(model)
+# dist_print(model)
 
 if args.checkpoint_path:
     checkpoint_path = system.apply_rank_size_from_pattern(args.checkpoint_path, rank=parallel_env.global_rank, size=parallel_env.global_size)
@@ -107,14 +126,14 @@ if args.checkpoint_path:
     else:
         print('Checkpoint not loaded: file `%s` is not found. Will train the model from start.' % checkpoint_path)
 
-optimizer = torch.optim.SGD(model.parameters(), lr=1e-5)
+# optimizer = torch.optim.SGD(model.parameters(), lr=1e-5)
 
 torch.manual_seed(0)
 x = torch.tensor(torch.randn([batch_size, num_tokens, model_dim], dtype=torch.float32, device='cpu').detach().numpy(), dtype=torch.get_default_dtype(), requires_grad=False, device=device)
 y = torch.LongTensor(batch_size).random_(1).to(device)
 
-tuples = (dist_world_size, args.dtype, model_dim, hidden_size, batch_size * num_tokens, num_local_experts, top_value, a2a_ffn_overlap_degree, args.parallel_type, device)
-dist_print('[Benchmark] world_size = %s, dtype = %s, model_dim = %s, hidden_size = %s, samples = %s, num_local_experts = %s, topK = %s, a2a_ffn_overlap_degree = %s, parallel_type = `%s`, device = `%s`' % tuples)
+tuples = (dist_world_size, args.dtype, model_dim, hidden_size, batch_size, num_tokens, batch_size * num_tokens, num_local_experts, top_value, a2a_ffn_overlap_degree, args.parallel_type, device)
+dist_print('[Benchmark] world_size = %s, dtype = %s, model_dim = %s, hidden_size = %s, batch_size = %s, num_tokens = %s, samples = %s, num_local_experts = %s, topK = %s, a2a_ffn_overlap_degree = %s, parallel_type = `%s`, device = `%s`' % tuples)
 
 average_time, num_steps = 0, args.num_steps
 
@@ -123,38 +142,72 @@ if args.allreduce_degree == -1:
 else:
     params_for_all_reduce = [p for p in model.parameters() if not hasattr(p, 'skip_allreduce') and getattr(p, 'requires_grad', False)]
 
-for i in range(num_steps):
-    t_start = system.record_time()
+# filename = 'a6000_time.csv'
+# # 创建文件文件
+# if dist_rank==0:
+#     header = ['world_size', 'num_local_experts', 'top', 'batch_size', 'num_tokens', 'model_dim', 'hidden_size', 'a2a_ffn_overlap_degree', 'iter', 'time']
+#     file_utils.create_csv(filename, header)
 
-    if not args.eval:
-        optimizer.zero_grad()
-        output = model(x)
-        loss = F.nll_loss(output, y)
-        if args.l_aux_wt:
-            loss += args.l_aux_wt * model._moe_layer.l_aux
-        loss.backward()
-        if dist_world_size > 1:
-            for p in params_for_all_reduce:
-                p.grad /= dist_world_size
-                p.grad = net.simple_all_reduce(p.grad)
-        optimizer.step()
-    else:
-        with torch.no_grad():
+# if dist_rank==0:
+#         new_data = [dist_world_size, num_local_experts, top_value, batch_size, num_tokens, model_dim, hidden_size, a2a_ffn_overlap_degree, 0, 0.0]
+#         file_utils.add_record(filename, new_data)
+with torch.profiler.profile(
+    activities=[
+        torch.profiler.ProfilerActivity.CPU,
+        torch.profiler.ProfilerActivity.CUDA,
+    ],
+    schedule=torch.profiler.schedule(
+    wait=5,
+    warmup=5,
+    active=20),
+    ) as prof:
+    for i in range(num_steps):
+        # t_start = system.record_time()
+        # if dist_rank == 0:
+        #     file_utils.update_last_record(filename, 'iter', i)
+        if not args.eval:
+            # optimizer.zero_grad()
             output = model(x)
-            loss = F.nll_loss(output, y)
+            # loss = F.nll_loss(output, y)
+            # if args.l_aux_wt:
+            #     loss += args.l_aux_wt * model._moe_layer.l_aux
+            # loss.backward()
+            # if dist_world_size > 1:
+            #     for p in params_for_all_reduce:
+            #         p.grad /= dist_world_size
+            #         p.grad = net.simple_all_reduce(p.grad)
+            # optimizer.step()
+        else:
+            with torch.no_grad():
+                output = model(x)
+            # loss = F.nll_loss(output, y)
+        prof.step()
+    # if dist_rank == 0:
+    #     prof.export_chrome_trace(f"20240729/{args.expert_type}-NumLocExp{num_local_experts}-top{top_value}-BtcSz{batch_size}-NumToks{num_tokens}-overlap{a2a_ffn_overlap_degree}-ModelDim{model_dim}-HiddenSz{hidden_size}.json")
 
-    t_stop = system.record_time()
+    # t_stop = system.record_time()
 
-    num_global_experts = tutel_moe.moe_layer.global_expert_count(num_local_experts, group=system.get_local_session().model_group)
-    mm_ceof, cap_ceof = 1 if args.eval else 3, min(args.top, num_global_experts)
-    tflops = (batch_size * num_tokens * model_dim * hidden_size) * 4 * mm_ceof * cap_ceof * 1e-12 / (t_stop - t_start)
-    dist_print('STEP-%s: loss = %.5f, step_time = %.6f sec, perf = %.2f tflops.' % (i, float(loss.data), t_stop - t_start, tflops))
+    # num_global_experts = tutel_moe.moe_layer.global_expert_count(num_local_experts, group=system.get_local_session().model_group)
+    # mm_ceof, cap_ceof = 1 if args.eval else 3, min(args.top, num_global_experts)
+    # tflops = (batch_size * num_tokens * model_dim * hidden_size) * 4 * mm_ceof * cap_ceof * 1e-12 / (t_stop - t_start)
+    # dist_print('STEP-%s: loss = %.5f, step_time = %.6f sec, perf = %.2f tflops.' % (i, float(loss.data), t_stop - t_start, tflops))
+    # dist_print('STEP-%s: step_time = %.6f sec, perf = %.2f tflops.' % (i, t_stop - t_start, tflops))
 
-    if i + 10 >= num_steps:
-        average_time += t_stop - t_start
+    # if i + 20 >= num_steps:
+    #     average_time += t_stop - t_start
 
-average_time /= 10
-dist_print('\n[Summary] Average synchronized step_time = %s sec.' % average_time)
+    # 文件前20次iteration的数据删除掉
+    # if dist_rank==0:
+    #     if i < 20:
+            # with open(filename, 'r', encoding='utf-8') as file:
+            #     lines = file.readlines()
+            # if lines:
+            #     lines.pop()
+            # with open(filename, 'w', encoding='utf-8') as file:
+            #     file.writelines(lines)
+
+# average_time /= 20
+# dist_print('\n[Summary] Average synchronized step_time = %s sec.' % average_time)
 
 if args.checkpoint_path:
     torch.save(model.state_dict(), checkpoint_path)

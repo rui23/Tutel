@@ -28,8 +28,13 @@ def a2a_ffn_overlap_forward(input, expert_fn, a2a_ffn_overlap_degree, use_2dh, g
             for i, x in enumerate(input_split)
         ]
     else:
+        # print("input.shape", input.shape)
+        # input.shape = (nproc_per_node * num_local_experts, batch_size * num_tokens * top / ( nproc_per_node * num_local_experts), model_dim)
         input_ready = C.CurrentStreamRelease.apply(input, 0)
         input_scattered_after_a2a = C.AllToAllScatterAsync.apply(input_ready)
+        # print("input_scattered_after_a2a[0].shape", input_scattered_after_a2a[0].shape)
+        # input_scattered_after_a2a为一个列表，长度为a2a_ffn_overlap_degree，
+        # 每个元素的shape为 (nproc_per_node * num_local_experts, batch_size * num_tokens * top / ( nproc_per_node * num_local_experts * a2a_ffn_overlap_degree), model_dim)
 
     expert_output_scattered = [
         C.CurrentStreamRelease.apply(
@@ -39,7 +44,8 @@ def a2a_ffn_overlap_forward(input, expert_fn, a2a_ffn_overlap_degree, use_2dh, g
                         C.CurrentStreamAcquire.apply(
                             x,
                         i),
-                    group=group)
+                    group=group),
+                    i,
                 ),
             group=group),
         i)

@@ -603,6 +603,7 @@ class PrimSpatialSplit(torch.autograd.Function):
         input = swap_axis(input, 0, dim)
         return input
 
+# 将输入张量按照分布式计算的world size进行重排列和变形
 def pre_expert_permute(input, group=None):
     world_size = get_world_size(group)
     if world_size == 1:
